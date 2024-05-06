@@ -14,7 +14,7 @@ class MapMatrix{
 public:
   typedef std::pair<int,int>   N2;
 
-  std::map<N2,double>  data;
+  std::vector<T> triplets; // Store triplets instead of map
   int nbrow;
   int nbcol;
 
@@ -23,13 +23,13 @@ public:
     nbrow(nr), nbcol(nc) {}; 
 
   MapMatrix(const MapMatrix& m): 
-    nbrow(m.nbrow), nbcol(m.nbcol), data(m.data) {}; 
+    nbrow(m.nbrow), nbcol(m.nbcol), triplets(m.triplets) {}; 
   
   MapMatrix& operator=(const MapMatrix& m){ 
     if(this!=&m){
       nbrow=m.nbrow;
       nbcol=m.nbcol;
-      data=m.data;
+      triplets = m.triplets;
     }   
     return *this; 
   }
@@ -38,33 +38,72 @@ public:
   int NbCol() const {return nbcol;}
 
   double operator()(const int& j, const int& k) const {
-    auto search = data.find(std::make_pair(j,k));
-    if(search!=data.end()) return search->second;
+    for(const auto& t : triplets) {
+      if (t.row() == j && t.col() == k)
+        return t.value();
+     }
     return 0;
   }
 
-  double& Assign(const int& j, const int& k) {
-    return data[std::make_pair(j,k)];
+  double Assign(const int& j, const int& k) {
+    for(auto& t : triplets) {
+      if (t.row() == j && t.col() == k)
+        return t.value();
+     }
+    // If triplet doesn't exist, add it
+    triplets.push_back(T(j, k, 0.0)); // Initialize with 0.0
+    return triplets.back().value();
+    // return 0.0;
   }
 
-  // parallel matrix-vector product with distributed vector xi
-  std::vector<double> operator*(const std::vector<double>& xi) const {
+void Set(const int& j, const int& k, const double& value) {
+    // Search for existing triplet
+    for(auto& t : triplets) {
+        if (t.row() == j && t.col() == k) {
+            t = T(j, k, value); // Update existing triplet with new value
+            return;
+        }
+    }
+    // If triplet doesn't exist, add it
+    triplets.push_back(T(j, k, value)); // Add new triplet with specified value
+}
 
-
-
+ SpMat toSparseMatrix() const {
+        SpMat mat(nbrow, nbcol);
+        mat.setFromTriplets(triplets.begin(), triplets.end());
+        return mat;
+    }
+ // parallel matrix-vector product with distributed vector xi
+  
+std::vector<double> operator*(const std::vector<double>& xi) const {
+    // Create local copies of the input vector and result vector
     std::vector<double> x(NbCol());
-    std::copy(xi.begin(),xi.end(),x.begin());
-    
+    std::vector<double> local_b(NbRow(), 0.0);
 
-    std::vector<double> b(NbRow(),0.);
-    for(auto it=data.begin(); it!=data.end(); ++it){
-      int j = (it->first).first;
-      int k = (it->first).second; 
-      double Mjk = it->second;
-      b[j] += Mjk*x[k];
+    // Distribute xi to all processes
+    std::vector<double> recv_x(NbCol());
+    MPI_Scatter(xi.data(), NbCol(), MPI_DOUBLE, recv_x.data(), NbCol(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    // // Compute local part of matrix-vector product
+    // for(const auto& t : triplets) {
+    //   int j = it.first.first; // Row index
+    //   int k = it.first.second; // Column index
+    //   double Mjk = it.second; // Matrix value
+    //   local_b[j] += Mjk * recv_x[k];
+    // }
+     // Compute local part of matrix-vector product
+    for(auto it = triplets.begin(); it != triplets.end(); ++it) {
+        int j = it->row(); // Row index
+        int k = it->col(); // Column index
+        double Mjk = it->value(); // Matrix value
+        local_b[j] += Mjk * recv_x[k];
     }
 
-    return b;
+    // Gather local results to the master process
+    std::vector<double> global_b(NbRow());
+    MPI_Reduce(local_b.data(), global_b.data(), NbRow(), MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    return global_b;
   }
 };
 
@@ -132,11 +171,19 @@ void CG(const MapMatrix& A,
 
   // get the local diagonal block of A
   std::vector<Eigen::Triplet<double>> coefficients;
-  for(auto it=A.data.begin(); it!=A.data.end(); ++it){
-    int j = (it->first).first;
-    int k = (it->first).second;
-    if (k >= 0 && k < n) coefficients.push_back(Eigen::Triplet<double>(j,k,it->second)); 
-  }
+  // for(auto it=A.data.begin(); it!=A.data.end(); ++it){
+  //   for(const auto& t : triplets){
+  //   int j = (it->first).first;
+  //   int k = (it->first).second;
+  //   if (k >= 0 && k < n) coefficients.push_back(Eigen::Triplet<double>(j,k,it->second)); 
+  // }
+
+  // std::vector<Eigen::Triplet<double>> coefficients;
+    for(const auto& t : A.triplets) {
+        int j = t.row();
+        int k = t.col();
+        if (k >= 0 && k < n) coefficients.push_back(Eigen::Triplet<double>(j, k, t.value()));
+    }
 
   // compute the Cholesky factorization of the diagonal block for the preconditioner
   Eigen::SparseMatrix<double> B(n,n);
@@ -196,14 +243,15 @@ int find_int_arg(int argc, char** argv, const char* option, int default_value) {
 }
 
 int main(int argc, char* argv[]) {
+  // std::cout << "1" << std::endl << std::flush;
   MPI_Init(&argc, &argv); // Initialize the MPI environment
-  
+  // std::cout << "2" << std::endl << std::flush;
   int size;
   MPI_Comm_size(MPI_COMM_WORLD, &size); // Get the number of processes
-  
+  // std::cout << "3" << std::endl << std::flush;
   int rank;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank); // Get the rank of the process
-
+// std::cout << "4" << std::endl << std::flush;
     if (find_arg_idx(argc, argv, "-h") >= 0) {
         std::cout << "-N <int>: side length of the sparse matrix" << std::endl;
         return 0;
@@ -219,18 +267,29 @@ int main(int argc, char* argv[]) {
 
   // row-distributed matrix
   MapMatrix A(n,N);
-
+// std::cout << "5" << std::endl << std::flush;
   int offset = n*rank;
-
+// std::cout << "51" << std::endl << std::flush;
   // local rows of the 1D Laplacian matrix; local column indices start at -1 for rank > 0
-  for (int i=0; i<n; i++) {
-    A.Assign(i,i)=2.0;
-    if (offset + i - 1 >= 0) A.Assign(i,i - 1) = -1;
-    if (offset + i + 1 < N)  A.Assign(i,i + 1) = -1;
-    if (offset + i + N < N) A.Assign(i, i + N) = -1;
-    if (offset + i - N >= 0) A.Assign(i, i - N) = -1;
-  }
+  // for (int i=0; i<n; i++) {
+  //   A.Assign(i,i)=2.0;
+  //   if (offset + i - 1 >= 0) A.Assign(i,i - 1) = -1;
+  //   if (offset + i + 1 < N)  A.Assign(i,i + 1) = -1;
+  //   if (offset + i + N < N) A.Assign(i, i + N) = -1;
+  //   if (offset + i - N >= 0) A.Assign(i, i - N) = -1;
+  // }
 
+  for (int i = 0; i < n; i++) {
+    // std::cout << "52, " << i << std::endl << std::flush;
+    A.Set(i, i, 2.0);
+    // std::cout << "53, " << i << std::endl << std::flush;
+    if (offset + i - 1 >= 0) A.Set(i, i - 1, -1);
+    // std::cout << "54, " << i << std::endl << std::flush;
+    if (offset + i + 1 < N)  A.Set(i, i + 1, -1);
+    if (offset + i + N < N) A.Set(i, i + N, -1);
+    if (offset + i - N >= 0) A.Set(i, i - N, -1);
+}
+// std::cout << "6" << std::endl << std::flush;
   // initial guess
   std::vector<double> x(n,0);
 
@@ -241,7 +300,7 @@ int main(int argc, char* argv[]) {
   double time = MPI_Wtime();
 
   CG(A,b,x);
-
+// std::cout << "7" << std::endl << std::flush;
   MPI_Barrier(MPI_COMM_WORLD);
   if (rank == 0) std::cout << "wall time for CG: " << MPI_Wtime()-time << std::endl;
 
@@ -251,6 +310,6 @@ int main(int argc, char* argv[]) {
   if (rank == 0) std::cout << "|Ax-b|/|b| = " << err << std::endl;
 
   MPI_Finalize(); // Finalize the MPI environment
-
+// std::cout << "8" << std::endl << std::flush;
   return 0;
 }
