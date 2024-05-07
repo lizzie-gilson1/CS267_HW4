@@ -10,6 +10,8 @@
 typedef Eigen::SparseMatrix<double> SpMat; // declares a column-major sparse matrix type of double
 typedef Eigen::Triplet<double> T;
 
+using namespace std;
+
 class MapMatrix{
 public:
   typedef std::pair<int,int>   N2;
@@ -49,12 +51,8 @@ public:
 
   // parallel matrix-vector product with distributed vector xi
   std::vector<double> operator*(const std::vector<double>& xi) const {
-
-
-
     std::vector<double> x(NbCol());
     std::copy(xi.begin(),xi.end(),x.begin());
-    
 
     std::vector<double> b(NbRow(),0.);
     for(auto it=data.begin(); it!=data.end(); ++it){
@@ -64,7 +62,22 @@ public:
       b[j] += Mjk*x[k];
     }
 
-    return b;
+    // Perform a global reduction to gather the results from all processes
+    std::vector<double> global_b(NbRow());
+    MPI_Allreduce(b.data(), global_b.data(), NbRow(), MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+
+    return global_b;
+  }
+
+
+  // print the matrix
+  void print() const {
+    for(int j=0; j<NbRow(); j++){
+      for(int k=0; k<NbCol(); k++){
+        std::cout << (*this)(j,k) << " ";
+      }
+      std::cout << std::endl;
+    }
   }
 };
 
@@ -73,10 +86,15 @@ public:
 // parallel scalar product (u,v) (u and v are distributed)
 double operator,(const std::vector<double>& u, const std::vector<double>& v){ 
   assert(u.size()==v.size());
-  double sp=0.;
-  for(int j=0; j<u.size(); j++){sp+=u[j]*v[j];}
+  double local_sp = 0.0;
+  for(int j=0; j<u.size(); j++){
+    local_sp += u[j] * v[j];
+  }
 
-  return sp; 
+  double global_sp = 0.0;
+  MPI_Allreduce(&local_sp, &global_sp, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+
+  return global_sp; 
 }
 
 // norm of a vector u
@@ -209,16 +227,22 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+  // cout << "size: " << size << endl;
+  // cout << "rank: " << rank << endl;
 
-
-
-  int N = find_int_arg(argc, argv, "-N", 100000); // global size
+  int N = find_int_arg(argc, argv, "-N", 100000000); // global size
 
   assert(N%size == 0);
   int n = N/size; // number of local rows
 
+  // cout << "N: " << N << endl;
+  // cout << "n: " << n << endl;
+
   // row-distributed matrix
   MapMatrix A(n,N);
+
+  // // print the matrix
+  // A.print();
 
   int offset = n*rank;
 
@@ -231,6 +255,9 @@ int main(int argc, char* argv[]) {
     if (offset + i - N >= 0) A.Assign(i, i - N) = -1;
   }
 
+  // // print the matrix
+  // A.print();
+
   // initial guess
   std::vector<double> x(n,0);
 
@@ -240,14 +267,33 @@ int main(int argc, char* argv[]) {
   MPI_Barrier(MPI_COMM_WORLD);
   double time = MPI_Wtime();
 
+  // perform gather all to gather the right-hand side
+  std::vector<double> global_b(N);
+  MPI_Allgather(b.data(), n, MPI_DOUBLE, global_b.data(), n, MPI_DOUBLE, MPI_COMM_WORLD);
+   
   CG(A,b,x);
+
+  // A.print();
+
+  // // print b
+  // for (int i=0; i<n; i++) {
+  //   std::cout << "b[" << i << "] = " << b[i] << std::endl;
+  // }
+
+  // // print the solution
+  // for (int i=0; i<n; i++) {
+  //   std::cout << "x[" << i << "] = " << x[i] << std::endl;
+  // }
 
   MPI_Barrier(MPI_COMM_WORLD);
   if (rank == 0) std::cout << "wall time for CG: " << MPI_Wtime()-time << std::endl;
 
   std::vector<double> r = A*x + (-1)*b;
+  std::vector<double> global_r(N);
 
-  double err = Norm(r)/Norm(b);
+  MPI_Allgather(r.data(), n, MPI_DOUBLE, global_r.data(), n, MPI_DOUBLE, MPI_COMM_WORLD);
+
+  double err = Norm(global_r)/Norm(global_b);
   if (rank == 0) std::cout << "|Ax-b|/|b| = " << err << std::endl;
 
   MPI_Finalize(); // Finalize the MPI environment
